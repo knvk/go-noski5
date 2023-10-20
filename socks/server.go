@@ -3,30 +3,37 @@ package socks5
 import (
 	"bufio"
 	"context"
-
-	//	"fmt"
 	"io"
 	"log"
 	"net"
-	//	"os"
-	//	"errors"
 )
-
-// Config is used to setup and configure a Server
-type Config struct {
-	//AuthMethods
-	//Credentials
-	///Resolver NameResolver
-	//Rules
-}
 
 // Server is responsible for accepting connections and handling
 // the details of the SOCKS5 protocol
 type Server struct {
-	Addr    string
-	Network string
-	//config  *Config
-	//authMethods auth
+	Addr       string
+	Network    string
+	AuthMethod uint8
+	AuthFunc   Authenticator
+}
+
+func NewSocksServ(addr, network string, authM Authenticator) *Server {
+	var authMethod uint8
+	switch authM.(type) {
+	case NoAuthMethod:
+		authMethod = AuthNone
+	case PassAuthMethod:
+		authMethod = AuthPasswd
+	default:
+		authMethod = AuthNone
+	}
+	srv := &Server{
+		Addr:       addr,
+		Network:    network,
+		AuthMethod: authMethod,
+		AuthFunc:   authM,
+	}
+	return srv
 }
 
 // ListenAndServe is used to create a listener
@@ -34,6 +41,7 @@ func (s *Server) ListenAndServe() error {
 	log.Printf("Starting server on %v\n", s.Addr)
 	l, err := net.Listen(s.Network, s.Addr)
 	if err != nil {
+		log.Printf("err %v", err)
 		return err
 	}
 	return s.Serve(l)
@@ -46,18 +54,17 @@ func (s *Server) Serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
-		//go
-		go s.HandleConn(conn)
+		go s.HandleClient(conn)
 	}
 }
 
 // ServeConn is used to serve a single connection.
-func (s *Server) HandleConn(conn net.Conn) {
+func (s *Server) HandleClient(conn net.Conn) {
 	defer conn.Close()
 	ctx := context.Background()
 	rbuf := bufio.NewReader(conn)
 	wbuf := io.Writer(conn)
-	if err := Auth(rbuf, wbuf); err != nil {
+	if err := s.auth(rbuf, wbuf); err != nil {
 		log.Printf("Error: %v\n", err)
 		return
 	}
@@ -78,6 +85,7 @@ func (s *Server) HandleConn(conn net.Conn) {
 		return
 	}
 }
+
 func (s *Server) HandleRequest(ctx context.Context, req *Request) error {
 	switch req.Cmd {
 	case CommandConnect:

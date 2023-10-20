@@ -1,7 +1,6 @@
 package socks5
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -25,10 +24,6 @@ const (
 	AtypeIP4 uint8 = 0x01
 	AtypeDN  uint8 = 0x03
 	AtypeIP6 uint8 = 0x04
-	// Auth methods
-	AuthNone         uint8 = 0x00
-	AuthPasswd       uint8 = 0x02
-	AuthNoAcceptable uint8 = 0xFF
 	// Reply codes
 	RespSucceeded          ResponseCode = 0x00
 	RespServerFailure      ResponseCode = 0x01
@@ -52,17 +47,37 @@ var (
 type ResponseCode uint8
 
 /*
-    Clients Negotiation:
-    +----+----------+----------+
-	|VER | NMETHODS | METHODS  |
-    +----+----------+----------+
-    | 1  |    1     | 1 to 255 |
-    +----+----------+----------+
+	    Clients Negotiation:
+	    +----+----------+----------+
+		|VER | NMETHODS | METHODS  |
+	    +----+----------+----------+
+	    | 1  |    1     | 1 to 255 |
+	    +----+----------+----------+
 */
 type HelloMsg struct {
 	Ver      byte
 	Nmethods byte
 	Methods  []byte
+}
+
+/*
++----+------+----------+------+----------+
+|VER | ULEN |  UNAME   | PLEN |  PASSWD  |
++----+------+----------+------+----------+
+| 1  |  1   | 1 to 255 |  1   | 1 to 255 |
++----+------+----------+------+----------+
+*/
+
+type AuthMsg struct {
+	Ver  byte
+	ULen byte
+	User string
+	PLen byte
+	Pass string
+}
+
+func (a *AuthMsg) String() string {
+	return fmt.Sprintf("User: %s Pass: %s", string(a.User), string(a.Pass))
 }
 
 /*
@@ -105,34 +120,28 @@ func (r *Request) GetDstAddres() string {
 	return fmt.Sprintf(r.DstAddr.String() + ":" + strconv.FormatUint(uint64(r.DstPort), 10))
 }
 
-func Auth(r io.Reader, w io.Writer) error {
-	header := make([]byte, 2)
-	if _, err := r.Read(header); err != nil {
-		log.Printf("socks: Failed to get data %v", err)
+func (s *Server) auth(r io.Reader, w io.Writer) error {
+	buf := make([]byte, 2)
+	hlmsg := &HelloMsg{}
+	if _, err := r.Read(buf); err != nil {
+		log.Printf("Failed to get data %v", err)
 		return err
 	}
+	hlmsg.Ver = buf[0]
+	hlmsg.Nmethods = buf[1]
+	hlmsg.Methods = make([]byte, hlmsg.Nmethods)
 
-	if uint8(header[0]) != socks5Version {
+	if hlmsg.Ver != socks5Version {
 		return ErrUnsupportedVer
 	}
 
-	numMethods := int(header[1])
-	methods := make([]byte, numMethods)
-
-	if _, err := io.ReadAtLeast(r, methods, numMethods); err != nil {
+	if _, err := io.ReadAtLeast(r, hlmsg.Methods, int(hlmsg.Nmethods)); err != nil {
 		return err
 	}
 
-	hlmsg := &HelloMsg{
-		header[0],
-		header[1],
-		methods}
-
-	for _, method := range methods {
-		if method == byte(0) {
-			log.Printf("Hello Message: %v", *hlmsg)
-			w.Write([]byte{socks5Version, AuthNone})
-			return nil
+	for _, method := range hlmsg.Methods {
+		if method == s.AuthMethod {
+			return s.AuthFunc.Authenticate(r, w)
 		}
 	}
 	w.Write([]byte{socks5Version, AuthNoAcceptable})
@@ -223,19 +232,10 @@ func (s *Server) HandleConnect(ctx context.Context, req *Request) error {
 
 	req.Reply(resp, bndAddr)
 
-	errCh := make(chan error, 2)
-	r := bufio.NewReader(req.Conn)
-
-	go proxy(dstConn, r, errCh)
-	go proxy(req.Conn, dstConn, errCh)
-
-	// Wait
-	for i := 0; i < 2; i++ {
-		e := <-errCh
-		if e != nil {
-			// return from this function closes target (and conn).
-			return e
-		}
+	err = proxy(dstConn, req.Conn)
+	if err != nil {
+		log.Println(err)
+		return err
 	}
 
 	return nil
@@ -249,7 +249,6 @@ func (req *Request) Reply(rc ResponseCode, p []byte) error {
 	msg[2] = 0x00 // RSV
 	msg[3] = 1    // we always bind to ipv4
 	msg = append(msg, p...)
-	//log.Printf("Reply: %v", msg)
 	if _, err := req.Conn.Write(msg); err != nil {
 		return err
 	}
@@ -257,9 +256,14 @@ func (req *Request) Reply(rc ResponseCode, p []byte) error {
 }
 
 // proxy is used to copy data from src to destination, and sends errors
-// to err channel
-func proxy(dst io.Writer, src io.Reader, errCh chan error) {
+// dst is serv src is client
+func proxy(dst io.ReadWriter, src io.ReadWriter) error {
 	defer dst.(*net.TCPConn).Close()
+
+	go io.Copy(src, dst)
 	_, err := io.Copy(dst, src)
-	errCh <- err
+	if err != nil {
+		return err
+	}
+	return nil
 }

@@ -1,3 +1,3 @@
-module noski5
+module github.com/knvk/go-noski5
 
-go 1.17
+go 1.21.2
